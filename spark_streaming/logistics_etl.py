@@ -1,284 +1,379 @@
+#!/usr/bin/env python3
+"""
+Logistics ETL Pipeline configured for Docker environment without Hadoop dependencies
+"""
+
+import os
+import sys
+import warnings
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import *
 from pyspark.sql.types import *
 import redis
 import psycopg2
-from psycopg2.extras import RealDictCursor
+import logging
 
-class LogisticsETL:
-    def __init__(self):
-        self.spark = SparkSession.builder \
+# Suppress warnings
+warnings.filterwarnings("ignore")
+os.environ['PYTHONWARNINGS'] = 'ignore'
+
+# Set environment variables to bypass Hadoop
+os.environ['SPARK_LOCAL_IP'] = '0.0.0.0'
+os.environ['SPARK_LOCAL_HOSTNAME'] = 'etl-app'
+os.environ['HADOOP_CONF_DIR'] = '/tmp/empty-hadoop-conf'
+os.environ['SPARK_HADOOP_CONF_DIR'] = '/tmp/empty-hadoop-conf'
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+def create_spark_session():
+    """Create Spark session in local mode without Hadoop dependencies"""
+    try:
+        spark = SparkSession.builder \
             .appName("LogisticsETL") \
-            .config("spark.sql.streaming.checkpointLocation", "/tmp/checkpoint") \
+            .master("spark://spark-master:7077") \
+            .config("spark.jars", "/app/jars/postgresql-42.7.6.jar,/app/jars/spark-sql-kafka-0-10_2.12-3.5.0.jar") \
+            .config("spark.sql.adaptive.enabled", "true") \
+            .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
+            .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
+            .config("spark.executor.memory", "1g") \
+            .config("spark.driver.memory", "1g") \
+            .config("spark.driver.host", "etl-app") \
+            .config("spark.driver.bindAddress", "0.0.0.0") \
+            .config("spark.sql.warehouse.dir", "/tmp/spark-warehouse") \
+            .config("spark.sql.streaming.checkpointLocation", "/tmp/spark-checkpoints") \
+            .config("spark.driver.extraJavaOptions", "-Dio.netty.tryReflectionSetAccessible=true") \
+            .config("spark.executor.extraJavaOptions", "-Dio.netty.tryReflectionSetAccessible=true") \
+            .config("spark.sql.execution.arrow.pyspark.enabled", "false") \
+            .config("spark.hadoop.fs.defaultFS", "file:///") \
             .config("spark.sql.streaming.forceDeleteTempCheckpointLocation", "true") \
+            .config("spark.hadoop.fs.file.impl", "org.apache.hadoop.fs.LocalFileSystem") \
+            .config("spark.hadoop.fs.file.impl.disable.cache", "true") \
             .getOrCreate()
         
-        self.spark.sparkContext.setLogLevel("WARN")
-        
-        self.redis_client = redis.Redis(host='localhost', port=6379, db=0)
-        
-        # Database connection
-        self.db_config = {
-            'host': 'localhost',
-            'database': 'logistics_db',
-            'user': 'admin',
-            'password': 'password'
-        }
-        
-        self.setup_database()
+        spark.sparkContext.setLogLevel("ERROR")
+        logger.info("✓ Spark session created successfully")
+        logger.info(f"Spark version: {spark.version}")
+        logger.info(f"Spark master: {spark.sparkContext.master}")
+        return spark
+    except Exception as e:
+        logger.error(f"✗ Failed to create Spark session: {e}")
+        return None
+
+def test_connections():
+    """Test all service connections"""
+    connections = {'redis': False, 'postgres': False}
     
-    def setup_database(self):
-        """Initialize database tables"""
-        with psycopg2.connect(**self.db_config) as conn:
-            with conn.cursor() as cur:
-                # Driver locations table
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS driver_locations (
-                        id SERIAL PRIMARY KEY,
-                        timestamp TIMESTAMP,
-                        driver_id VARCHAR(50),
-                        latitude DOUBLE PRECISION,
-                        longitude DOUBLE PRECISION,
-                        speed DOUBLE PRECISION,
-                        heading DOUBLE PRECISION,
-                        status VARCHAR(20)
-                    )
-                """)
-                
-                # Delivery analytics table
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS delivery_analytics (
-                        id SERIAL PRIMARY KEY,
-                        timestamp TIMESTAMP,
-                        order_id VARCHAR(50),
-                        driver_id VARCHAR(50),
-                        status VARCHAR(30),
-                        delay_minutes INTEGER,
-                        delay_reason VARCHAR(100)
-                    )
-                """)
-                
-                # Real-time KPIs table
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS realtime_kpis (
-                        id SERIAL PRIMARY KEY,
-                        timestamp TIMESTAMP,
-                        metric_name VARCHAR(50),
-                        metric_value DOUBLE PRECISION,
-                        area_id VARCHAR(20)
-                    )
-                """)
-                
-                conn.commit()
+    # Test Redis
+    try:
+        r = redis.Redis(host='redis', port=6379, db=0, socket_connect_timeout=5)
+        r.ping()
+        logger.info("✓ Redis connection successful")
+        connections['redis'] = True
+    except Exception as e:
+        logger.error(f"✗ Redis connection failed: {e}")
+        logger.info("⚠ Continuing without Redis...")
     
-    def process_driver_locations(self):
-        """Process driver location stream"""
-        df = self.spark \
-            .readStream \
-            .format("kafka") \
-            .option("kafka.bootstrap.servers", "localhost:9092") \
-            .option("subscribe", "driver_locations") \
-            .load()
+    # Test PostgreSQL
+    try:
+        conn = psycopg2.connect(
+            host="logistics-postgres",
+            port="5432",
+            database="logistics_db",
+            user="vb",
+            password="varad123",
+            connect_timeout=5
+        )
+        conn.close()
+        logger.info("✓ Database connection successful")
+        connections['postgres'] = True
+    except Exception as e:
+        logger.error(f"✗ Database connection failed: {e}")
+        logger.info("⚠ Database connection failed. ETL will run without database persistence.")
+    
+    return connections
+
+def test_kafka_connection():
+    """Test Kafka connection"""
+    try:
+        from kafka import KafkaProducer
+        from kafka.errors import NoBrokersAvailable
         
-        # Parse JSON data
-        schema = StructType([
-            StructField("timestamp", StringType(), True),
+        producer = KafkaProducer(
+            bootstrap_servers=['kafka:29092'],
+            api_version=(0, 10, 1),
+            request_timeout_ms=5000
+        )
+        producer.close()
+        logger.info("✓ Kafka connection successful")
+        return True
+    except ImportError:
+        logger.warning("⚠ kafka-python not installed")
+        return False
+    except NoBrokersAvailable:
+        logger.error("✗ Kafka broker not available at kafka:29092")
+        logger.info("⚠ Starting in mock data mode")
+        return False
+    except Exception as e:
+        logger.error(f"✗ Kafka connection failed: {e}")
+        logger.info("⚠ Starting in mock data mode")
+        return False
+
+def create_mock_data_stream(spark, topic_name):
+    """Create mock streaming data when Kafka is not available"""
+    try:
+        logger.info(f"📊 Creating mock data stream for {topic_name}...")
+        
+        if topic_name == "driver-locations":
+            schema = StructType([
+                StructField("driver_id", StringType(), True),
+                StructField("latitude", DoubleType(), True),
+                StructField("longitude", DoubleType(), True),
+                StructField("timestamp", TimestampType(), True),
+                StructField("speed", DoubleType(), True),
+                StructField("heading", DoubleType(), True)
+            ])
+            mock_data = [
+                ("driver_001", 40.7128, -74.0060, "2024-06-25 10:00:00", 45.5, 180.0),
+                ("driver_002", 40.7589, -73.9851, "2024-06-25 10:01:00", 30.2, 90.0),
+                ("driver_003", 40.7505, -73.9934, "2024-06-25 10:02:00", 25.8, 270.0)
+            ]
+        elif topic_name == "delivery-status":
+            schema = StructType([
+                StructField("delivery_id", StringType(), True),
+                StructField("status", StringType(), True),
+                StructField("timestamp", TimestampType(), True),
+                StructField("location", StringType(), True),
+                StructField("driver_id", StringType(), True),
+                StructField("customer_id", StringType(), True)
+            ])
+            mock_data = [
+                ("del_001", "delivered", "2024-06-25 10:00:00", "NYC", "driver_001", "cust_001"),
+                ("del_002", "in_transit", "2024-06-25 10:01:00", "NYC", "driver_002", "cust_002"),
+                ("del_003", "picked_up", "2024-06-25 10:02:00", "NYC", "driver_003", "cust_003")
+            ]
+        
+        df = spark.createDataFrame(mock_data, schema)
+        df = df.withColumn("timestamp", current_timestamp())
+        return df
+    except Exception as e:
+        logger.error(f"✗ Failed to create mock data stream: {e}")
+        return None
+
+def process_driver_locations(spark, use_kafka=True):
+    """Process driver location data from Kafka or mock data"""
+    try:
+        logger.info("📍 Starting driver location processing...")
+        
+        location_schema = StructType([
             StructField("driver_id", StringType(), True),
             StructField("latitude", DoubleType(), True),
             StructField("longitude", DoubleType(), True),
+            StructField("timestamp", TimestampType(), True),
             StructField("speed", DoubleType(), True),
-            StructField("heading", DoubleType(), True),
-            StructField("status", StringType(), True)
+            StructField("heading", DoubleType(), True)
         ])
         
-        parsed_df = df.select(
-            from_json(col("value").cast("string"), schema).alias("data")
-        ).select("data.*")
+        if use_kafka:
+            df = spark \
+                .readStream \
+                .format("kafka") \
+                .option("kafka.bootstrap.servers", "kafka:29092") \
+                .option("subscribe", "driver-locations") \
+                .option("startingOffsets", "latest") \
+                .option("failOnDataLoss", "false") \
+                .load()
+            
+            parsed_df = df.select(
+                from_json(col("value").cast("string"), location_schema).alias("data")
+            ).select("data.*")
+        else:
+            mock_df = create_mock_data_stream(spark, "driver-locations")
+            if mock_df is None:
+                return None
+            parsed_df = spark.readStream.format("rate").option("rowsPerSecond", 1).load() \
+                .withColumn("driver_id", lit("mock_driver")) \
+                .withColumn("latitude", lit(40.7128)) \
+                .withColumn("longitude", lit(-74.0060)) \
+                .withColumn("speed", lit(45.5)) \
+                .withColumn("heading", lit(180.0)) \
+                .select("driver_id", "latitude", "longitude", "timestamp", "speed", "heading")
         
-        # Add processing timestamp
         processed_df = parsed_df.withColumn("processed_at", current_timestamp())
         
-        # Write to PostgreSQL
         query = processed_df.writeStream \
             .outputMode("append") \
-            .foreachBatch(self.write_to_postgres) \
+            .format("console") \
+            .option("truncate", False) \
+            .option("numRows", 10) \
             .trigger(processingTime='10 seconds') \
             .start()
         
+        logger.info("✓ Driver location processing started")
         return query
-    
-    def process_delivery_status(self):
-        """Process delivery status with anomaly detection"""
-        df = self.spark \
-            .readStream \
-            .format("kafka") \
-            .option("kafka.bootstrap.servers", "localhost:9092") \
-            .option("subscribe", "delivery_status") \
-            .load()
+    except Exception as e:
+        logger.error(f"✗ Failed to start driver location processing: {e}")
+        return None
+
+def process_delivery_status(spark, use_kafka=True):
+    """Process delivery status updates from Kafka or mock data"""
+    try:
+        logger.info("📦 Starting delivery status processing...")
         
-        schema = StructType([
-            StructField("timestamp", StringType(), True),
-            StructField("order_id", StringType(), True),
-            StructField("driver_id", StringType(), True),
+        delivery_schema = StructType([
+            StructField("delivery_id", StringType(), True),
             StructField("status", StringType(), True),
-            StructField("delay_reason", StringType(), True),
-            StructField("delay_minutes", IntegerType(), True)
+            StructField("timestamp", TimestampType(), True),
+            StructField("location", StringType(), True),
+            StructField("driver_id", StringType(), True),
+            StructField("customer_id", StringType(), True)
         ])
         
-        parsed_df = df.select(
-            from_json(col("value").cast("string"), schema).alias("data")
-        ).select("data.*")
+        if use_kafka:
+            df = spark \
+                .readStream \
+                .format("kafka") \
+                .option("kafka.bootstrap.servers", "kafka:29092") \
+                .option("subscribe", "delivery-status") \
+                .option("startingOffsets", "latest") \
+                .option("failOnDataLoss", "false") \
+                .load()
+            
+            parsed_df = df.select(
+                from_json(col("value").cast("string"), delivery_schema).alias("data")
+            ).select(" Writer: data.*")
+        else:
+            parsed_df = spark.readStream.format("rate").option("rowsPerSecond", 1).load() \
+                .withColumn("delivery_id", concat(lit("del_"), col("value").cast("string"))) \
+                .withColumn("status", lit("delivered")) \
+                .withColumn("location", lit("NYC")) \
+                .withColumn("driver_id", lit("mock_driver")) \
+                .withColumn("customer_id", concat(lit("cust_"), col("value").cast("string"))) \
+                .select("delivery_id", "status", "timestamp", "location", "driver_id", "customer_id")
         
-        # Anomaly detection for delays
-        anomaly_df = parsed_df.filter(
-            (col("delay_minutes") > 30) | 
-            (col("status") == "cancelled")
-        ).withColumn("anomaly_type", 
-            when(col("delay_minutes") > 30, "high_delay")
-            .when(col("status") == "cancelled", "cancellation")
-            .otherwise("unknown")
-        )
+        processed_df = parsed_df.withColumn("processed_at", current_timestamp())
         
-        # Write anomalies to Redis for real-time alerts
-        anomaly_query = anomaly_df.writeStream \
+        query = processed_df.writeStream \
             .outputMode("append") \
-            .foreachBatch(self.write_anomalies_to_redis) \
-            .trigger(processingTime='5 seconds') \
-            .start()
-        
-        # Write all delivery data to PostgreSQL
-        delivery_query = parsed_df.writeStream \
-            .outputMode("append") \
-            .foreachBatch(self.write_delivery_analytics_to_postgres) \
+            .format("console") \
+            .option("truncate", False) \
+            .option("numRows", 10) \
             .trigger(processingTime='10 seconds') \
             .start()
         
-        return [anomaly_query, delivery_query]
-    
-    def calculate_realtime_kpis(self):
-        """Calculate real-time KPIs"""
-        # Driver locations KPIs
-        driver_df = self.spark \
-            .readStream \
-            .format("kafka") \
-            .option("kafka.bootstrap.servers", "localhost:9092") \
-            .option("subscribe", "driver_locations") \
-            .load()
+        logger.info("✓ Delivery status processing started")
+        return query
+    except Exception as e:
+        logger.error(f"✗ Failed to start delivery status processing: {e}")
+        return None
+
+def calculate_kpis(spark, use_kafka=True):
+    """Calculate real-time KPIs"""
+    try:
+        logger.info("📊 Starting KPI calculations...")
         
-        # Delivery status KPIs
-        delivery_df = self.spark \
-            .readStream \
-            .format("kafka") \
-            .option("kafka.bootstrap.servers", "localhost:9092") \
-            .option("subscribe", "delivery_status") \
-            .load()
+        if use_kafka:
+            df = spark \
+                .readStream \
+                .format("kafka") \
+                .option("kafka.bootstrap.servers", "kafka:29092") \
+                .option("subscribe", "delivery-status") \
+                .option("startingOffsets", "latest") \
+                .option("failOnDataLoss", "false") \
+                .load()
+            
+            delivery_schema = StructType([
+                StructField("delivery_id", StringType(), True),
+                StructField("status", StringType(), True),
+                StructField("timestamp", TimestampType(), True),
+                StructField("driver_id", StringType(), True)
+            ])
+            
+            parsed_df = df.select(
+                from_json(col("value").cast("string"), delivery_schema).alias("data")
+            ).select("data.*")
+        else:
+            parsed_df = spark.readStream.format("rate").option("rowsPerSecond", 2).load() \
+                .withColumn("delivery_id", concat(lit("del_"), col("value").cast("string"))) \
+                .withColumn("status", 
+                    when(col("value") % 3 == 0, "delivered")
+                    .when(col("value") % 3 == 1, "in_transit")
+                    .otherwise("picked_up")) \
+                .withColumn("driver_id", concat(lit("driver_"), (col("value") % 5).cast("string"))) \
+                .select("delivery_id", "status", "timestamp", "driver_id")
         
-        # Parse and calculate metrics
-        driver_schema = StructType([
-            StructField("driver_id", StringType(), True),
-            StructField("status", StringType(), True),
-            StructField("speed", DoubleType(), True)
-        ])
+        kpis = parsed_df \
+            .withWatermark("timestamp", "2 minutes") \
+            .groupBy(
+                window(col("timestamp"), "1 minute"),
+                col("status")
+            ) \
+            .count() \
+            .withColumnRenamed("count", "delivery_count") \
+            .withColumn("kpi_calculated_at", current_timestamp())
         
-        parsed_drivers = driver_df.select(
-            from_json(col("value").cast("string"), driver_schema).alias("data")
-        ).select("data.*")
-        
-        # Calculate active drivers count
-        active_drivers = parsed_drivers \
-            .filter(col("status") != "idle") \
-            .groupBy(window(current_timestamp(), "1 minute")) \
-            .agg(countDistinct("driver_id").alias("active_drivers"))
-        
-        # Write KPIs
-        kpi_query = active_drivers.writeStream \
+        query = kpis.writeStream \
             .outputMode("update") \
-            .foreachBatch(self.write_kpis_to_postgres) \
+            .format("console") \
+            .option("truncate", False) \
+            .option("numRows", 20) \
             .trigger(processingTime='30 seconds') \
             .start()
         
-        return kpi_query
+        logger.info("✓ KPI calculations started")
+        return query
+    except Exception as e:
+        logger.error(f"✗ Failed to start KPI calculations: {e}")
+        return None
+
+def main():
+    """Main ETL pipeline execution"""
+    logger.info("🚀 Starting Logistics ETL Pipeline...")
     
-    def write_to_postgres(self, df, epoch_id):
-        """Write DataFrame to PostgreSQL"""
-        if df.count() > 0:
-            df.write \
-                .format("jdbc") \
-                .option("url", f"jdbc:postgresql://localhost:5432/{self.db_config['database']}") \
-                .option("dbtable", "driver_locations") \
-                .option("user", self.db_config['user']) \
-                .option("password", self.db_config['password']) \
-                .mode("append") \
-                .save()
+    connections = test_connections()
+    kafka_available = test_kafka_connection()
     
-    def write_delivery_analytics_to_postgres(self, df, epoch_id):
-        """Write delivery analytics to PostgreSQL"""
-        if df.count() > 0:
-            df.write \
-                .format("jdbc") \
-                .option("url", f"jdbc:postgresql://localhost:5432/{self.db_config['database']}") \
-                .option("dbtable", "delivery_analytics") \
-                .option("user", self.db_config['user']) \
-                .option("password", self.db_config['password']) \
-                .mode("append") \
-                .save()
+    spark = create_spark_session()
+    if not spark:
+        logger.error("❌ Cannot proceed without Spark session")
+        return
     
-    def write_anomalies_to_redis(self, df, epoch_id):
-        """Write anomalies to Redis for real-time alerts"""
-        anomalies = df.collect()
-        for row in anomalies:
-            alert_data = {
-                'timestamp': row['timestamp'],
-                'order_id': row['order_id'],
-                'driver_id': row['driver_id'],
-                'anomaly_type': row['anomaly_type'],
-                'delay_minutes': row['delay_minutes'],
-                'delay_reason': row['delay_reason']
-            }
-            
-            # Store in Redis with TTL of 1 hour
-            self.redis_client.setex(
-                f"alert:{row['order_id']}", 
-                3600, 
-                json.dumps(alert_data, default=str)
-            )
+    queries = []
     
-    def write_kpis_to_postgres(self, df, epoch_id):
-        """Write KPIs to PostgreSQL"""
-        kpis = df.collect()
-        with psycopg2.connect(**self.db_config) as conn:
-            with conn.cursor() as cur:
-                for row in kpis:
-                    cur.execute("""
-                        INSERT INTO realtime_kpis (timestamp, metric_name, metric_value)
-                        VALUES (%s, %s, %s)
-                    """, (row['window']['start'], 'active_drivers', row['active_drivers']))
-                conn.commit()
+    driver_query = process_driver_locations(spark, use_kafka=kafka_available)
+    if driver_query:
+        queries.append(driver_query)
     
-    def start_streaming(self):
-        """Start all streaming queries"""
-        queries = []
-        
-        # Start driver location processing
-        queries.append(self.process_driver_locations())
-        
-        # Start delivery status processing
-        delivery_queries = self.process_delivery_status()
-        queries.extend(delivery_queries)
-        
-        # Start KPI calculations
-        queries.append(self.calculate_realtime_kpis())
-        
-        return queries
+    delivery_query = process_delivery_status(spark, use_kafka=kafka_available)
+    if delivery_query:
+        queries.append(delivery_query)
+    
+    kpi_query = calculate_kpis(spark, use_kafka=kafka_available)
+    if kpi_query:
+        queries.append(kpi_query)
+    
+    logger.info(f"✅ Started {len(queries)} streaming queries")
+    
+    if not kafka_available:
+        logger.info("🔄 Running in MOCK DATA MODE - Kafka not available")
+        logger.info("   To use real Kafka streams, ensure Kafka is running on kafka:29092")
+    
+    if queries:
+        logger.info("🎯 ETL pipeline is running. Press Ctrl+C to stop...")
+        try:
+            for query in queries:
+                query.awaitTermination()
+        except KeyboardInterrupt:
+            logger.info("🛑 Stopping ETL pipeline...")
+            for query in queries:
+                query.stop()
+        finally:
+            spark.stop()
+            logger.info("✅ ETL pipeline stopped successfully")
+    else:
+        logger.error("❌ No streaming queries started. Check your configuration.")
+        spark.stop()
 
 if __name__ == "__main__":
-    etl = LogisticsETL()
-    queries = etl.start_streaming()
-    
-    try:
-        for query in queries:
-            query.awaitTermination()
-    except KeyboardInterrupt:
-        print("Stopping streaming...")
-        for query in queries:
-            query.stop()
+    main()

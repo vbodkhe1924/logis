@@ -1,6 +1,6 @@
 import psutil
 import time
-from kafka import KafkaConsumer
+from confluent_kafka import Consumer
 import json
 import logging
 
@@ -11,17 +11,15 @@ class PipelineMonitor:
     
     def monitor_kafka_lag(self):
         """Monitor Kafka consumer lag"""
-        consumer = KafkaConsumer(
-            'driver_locations',
-            bootstrap_servers=['localhost:9092'],
-            group_id='monitor_group'
-        )
+        self.consumer = Consumer({
+        'bootstrap.servers': 'localhost:9092'
+            })
         
         # Get lag metrics
-        partitions = consumer.assignment()
+        partitions = Consumer.assignment()
         for partition in partitions:
-            committed = consumer.committed(partition)
-            last_offset = consumer.end_offsets([partition])[partition]
+            committed = Consumer.committed(partition)
+            last_offset = Consumer.end_offsets([partition])[partition]
             lag = last_offset - committed if committed else last_offset
             
             self.logger.info(f"Partition {partition.partition} lag: {lag}")

@@ -9,8 +9,6 @@ import warnings
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import *
 from pyspark.sql.types import *
-import redis
-import psycopg2
 import logging
 
 # Suppress warnings
@@ -28,55 +26,87 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 def create_spark_session():
-    """Create Spark session in local mode without Hadoop dependencies"""
+    """Create Spark session in local mode without external dependencies"""
     try:
-        spark = SparkSession.builder \
-            .appName("LogisticsETL") \
-            .master("spark://spark-master:7077") \
-            .config("spark.jars", "/app/jars/postgresql-42.7.6.jar,/app/jars/spark-sql-kafka-0-10_2.12-3.5.0.jar") \
-            .config("spark.sql.adaptive.enabled", "true") \
-            .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
-            .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
-            .config("spark.executor.memory", "1g") \
-            .config("spark.driver.memory", "1g") \
-            .config("spark.driver.host", "etl-app") \
-            .config("spark.driver.bindAddress", "0.0.0.0") \
-            .config("spark.sql.warehouse.dir", "/tmp/spark-warehouse") \
-            .config("spark.sql.streaming.checkpointLocation", "/tmp/spark-checkpoints") \
-            .config("spark.driver.extraJavaOptions", "-Dio.netty.tryReflectionSetAccessible=true") \
-            .config("spark.executor.extraJavaOptions", "-Dio.netty.tryReflectionSetAccessible=true") \
-            .config("spark.sql.execution.arrow.pyspark.enabled", "false") \
-            .config("spark.hadoop.fs.defaultFS", "file:///") \
-            .config("spark.sql.streaming.forceDeleteTempCheckpointLocation", "true") \
-            .config("spark.hadoop.fs.file.impl", "org.apache.hadoop.fs.LocalFileSystem") \
-            .config("spark.hadoop.fs.file.impl.disable.cache", "true") \
-            .getOrCreate()
+        # First try cluster mode, fallback to local mode
+        spark_configs = [
+            {
+                "name": "Cluster Mode",
+                "master": "spark://spark-master:7077",
+                "jars": "/app/jars/postgresql-42.7.6.jar,/app/jars/spark-sql-kafka-0-10_2.12-3.5.0.jar"
+            },
+            {
+                "name": "Local Mode",
+                "master": "local[*]",
+                "jars": None
+            }
+        ]
         
-        spark.sparkContext.setLogLevel("ERROR")
-        logger.info("✓ Spark session created successfully")
-        logger.info(f"Spark version: {spark.version}")
-        logger.info(f"Spark master: {spark.sparkContext.master}")
-        return spark
+        for config in spark_configs:
+            try:
+                logger.info(f"Attempting to create Spark session in {config['name']}...")
+                
+                builder = SparkSession.builder \
+                    .appName("LogisticsETL") \
+                    .master(config["master"]) \
+                    .config("spark.sql.adaptive.enabled", "true") \
+                    .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
+                    .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
+                    .config("spark.executor.memory", "1g") \
+                    .config("spark.driver.memory", "1g") \
+                    .config("spark.driver.host", "0.0.0.0") \
+                    .config("spark.driver.bindAddress", "0.0.0.0") \
+                    .config("spark.sql.warehouse.dir", "/tmp/spark-warehouse") \
+                    .config("spark.sql.streaming.checkpointLocation", "/tmp/spark-checkpoints") \
+                    .config("spark.driver.extraJavaOptions", "-Dio.netty.tryReflectionSetAccessible=true") \
+                    .config("spark.executor.extraJavaOptions", "-Dio.netty.tryReflectionSetAccessible=true") \
+                    .config("spark.sql.execution.arrow.pyspark.enabled", "false") \
+                    .config("spark.hadoop.fs.defaultFS", "file:///") \
+                    .config("spark.sql.streaming.forceDeleteTempCheckpointLocation", "true") \
+                    .config("spark.hadoop.fs.file.impl", "org.apache.hadoop.fs.LocalFileSystem") \
+                    .config("spark.hadoop.fs.file.impl.disable.cache", "true")
+                
+                if config["jars"] and os.path.exists("/app/jars/postgresql-42.7.6.jar"):
+                    builder = builder.config("spark.jars", config["jars"])
+                
+                spark = builder.getOrCreate()
+                spark.sparkContext.setLogLevel("ERROR")
+                logger.info(f"✓ Spark session created successfully in {config['name']}")
+                logger.info(f"Spark version: {spark.version}")
+                logger.info(f"Spark master: {spark.sparkContext.master}")
+                return spark
+                
+            except Exception as e:
+                logger.warning(f"Failed to create Spark session in {config['name']}: {e}")
+                continue
+        
+        logger.error("✗ Failed to create Spark session in any mode")
+        return None
+        
     except Exception as e:
         logger.error(f"✗ Failed to create Spark session: {e}")
         return None
 
 def test_connections():
-    """Test all service connections"""
+    """Test all service connections with proper error handling"""
     connections = {'redis': False, 'postgres': False}
     
     # Test Redis
     try:
+        import redis
         r = redis.Redis(host='redis', port=6379, db=0, socket_connect_timeout=5)
         r.ping()
         logger.info("✓ Redis connection successful")
         connections['redis'] = True
+    except ImportError:
+        logger.warning("⚠ Redis library not available")
     except Exception as e:
         logger.error(f"✗ Redis connection failed: {e}")
         logger.info("⚠ Continuing without Redis...")
     
     # Test PostgreSQL
     try:
+        import psycopg2
         conn = psycopg2.connect(
             host="logistics-postgres",
             port="5432",
@@ -88,6 +118,8 @@ def test_connections():
         conn.close()
         logger.info("✓ Database connection successful")
         connections['postgres'] = True
+    except ImportError:
+        logger.warning("⚠ PostgreSQL library not available")
     except Exception as e:
         logger.error(f"✗ Database connection failed: {e}")
         logger.info("⚠ Database connection failed. ETL will run without database persistence.")
@@ -95,7 +127,7 @@ def test_connections():
     return connections
 
 def test_kafka_connection():
-    """Test Kafka connection"""
+    """Test Kafka connection with fallback"""
     try:
         from kafka import KafkaProducer
         from kafka.errors import NoBrokersAvailable
@@ -111,10 +143,6 @@ def test_kafka_connection():
     except ImportError:
         logger.warning("⚠ kafka-python not installed")
         return False
-    except NoBrokersAvailable:
-        logger.error("✗ Kafka broker not available at kafka:29092")
-        logger.info("⚠ Starting in mock data mode")
-        return False
     except Exception as e:
         logger.error(f"✗ Kafka connection failed: {e}")
         logger.info("⚠ Starting in mock data mode")
@@ -126,37 +154,27 @@ def create_mock_data_stream(spark, topic_name):
         logger.info(f"📊 Creating mock data stream for {topic_name}...")
         
         if topic_name == "driver-locations":
-            schema = StructType([
-                StructField("driver_id", StringType(), True),
-                StructField("latitude", DoubleType(), True),
-                StructField("longitude", DoubleType(), True),
-                StructField("timestamp", TimestampType(), True),
-                StructField("speed", DoubleType(), True),
-                StructField("heading", DoubleType(), True)
-            ])
-            mock_data = [
-                ("driver_001", 40.7128, -74.0060, "2024-06-25 10:00:00", 45.5, 180.0),
-                ("driver_002", 40.7589, -73.9851, "2024-06-25 10:01:00", 30.2, 90.0),
-                ("driver_003", 40.7505, -73.9934, "2024-06-25 10:02:00", 25.8, 270.0)
-            ]
+            return spark.readStream.format("rate").option("rowsPerSecond", 1).load() \
+                .withColumn("driver_id", concat(lit("driver_"), (col("value") % 5).cast("string"))) \
+                .withColumn("latitude", 40.7128 + (rand() - 0.5) * 0.1) \
+                .withColumn("longitude", -74.0060 + (rand() - 0.5) * 0.1) \
+                .withColumn("speed", 20 + rand() * 60) \
+                .withColumn("heading", rand() * 360) \
+                .select("driver_id", "latitude", "longitude", "timestamp", "speed", "heading")
+                
         elif topic_name == "delivery-status":
-            schema = StructType([
-                StructField("delivery_id", StringType(), True),
-                StructField("status", StringType(), True),
-                StructField("timestamp", TimestampType(), True),
-                StructField("location", StringType(), True),
-                StructField("driver_id", StringType(), True),
-                StructField("customer_id", StringType(), True)
-            ])
-            mock_data = [
-                ("del_001", "delivered", "2024-06-25 10:00:00", "NYC", "driver_001", "cust_001"),
-                ("del_002", "in_transit", "2024-06-25 10:01:00", "NYC", "driver_002", "cust_002"),
-                ("del_003", "picked_up", "2024-06-25 10:02:00", "NYC", "driver_003", "cust_003")
-            ]
+            return spark.readStream.format("rate").option("rowsPerSecond", 1).load() \
+                .withColumn("delivery_id", concat(lit("del_"), col("value").cast("string"))) \
+                .withColumn("status", 
+                    when(col("value") % 3 == 0, "delivered")
+                    .when(col("value") % 3 == 1, "in_transit")
+                    .otherwise("picked_up")) \
+                .withColumn("location", lit("NYC")) \
+                .withColumn("driver_id", concat(lit("driver_"), (col("value") % 5).cast("string"))) \
+                .withColumn("customer_id", concat(lit("cust_"), col("value").cast("string"))) \
+                .select("delivery_id", "status", "timestamp", "location", "driver_id", "customer_id")
         
-        df = spark.createDataFrame(mock_data, schema)
-        df = df.withColumn("timestamp", current_timestamp())
-        return df
+        return None
     except Exception as e:
         logger.error(f"✗ Failed to create mock data stream: {e}")
         return None
@@ -166,40 +184,38 @@ def process_driver_locations(spark, use_kafka=True):
     try:
         logger.info("📍 Starting driver location processing...")
         
-        location_schema = StructType([
-            StructField("driver_id", StringType(), True),
-            StructField("latitude", DoubleType(), True),
-            StructField("longitude", DoubleType(), True),
-            StructField("timestamp", TimestampType(), True),
-            StructField("speed", DoubleType(), True),
-            StructField("heading", DoubleType(), True)
-        ])
-        
         if use_kafka:
-            df = spark \
-                .readStream \
-                .format("kafka") \
-                .option("kafka.bootstrap.servers", "kafka:29092") \
-                .option("subscribe", "driver-locations") \
-                .option("startingOffsets", "latest") \
-                .option("failOnDataLoss", "false") \
-                .load()
-            
-            parsed_df = df.select(
-                from_json(col("value").cast("string"), location_schema).alias("data")
-            ).select("data.*")
+            try:
+                location_schema = StructType([
+                    StructField("driver_id", StringType(), True),
+                    StructField("latitude", DoubleType(), True),
+                    StructField("longitude", DoubleType(), True),
+                    StructField("timestamp", TimestampType(), True),
+                    StructField("speed", DoubleType(), True),
+                    StructField("heading", DoubleType(), True)
+                ])
+                
+                df = spark \
+                    .readStream \
+                    .format("kafka") \
+                    .option("kafka.bootstrap.servers", "kafka:29092") \
+                    .option("subscribe", "driver-locations") \
+                    .option("startingOffsets", "latest") \
+                    .option("failOnDataLoss", "false") \
+                    .load()
+                
+                parsed_df = df.select(
+                    from_json(col("value").cast("string"), location_schema).alias("data")
+                ).select("data.*")
+            except Exception as e:
+                logger.warning(f"Kafka streaming failed, using mock data: {e}")
+                parsed_df = create_mock_data_stream(spark, "driver-locations")
         else:
-            mock_df = create_mock_data_stream(spark, "driver-locations")
-            if mock_df is None:
-                return None
-            parsed_df = spark.readStream.format("rate").option("rowsPerSecond", 1).load() \
-                .withColumn("driver_id", lit("mock_driver")) \
-                .withColumn("latitude", lit(40.7128)) \
-                .withColumn("longitude", lit(-74.0060)) \
-                .withColumn("speed", lit(45.5)) \
-                .withColumn("heading", lit(180.0)) \
-                .select("driver_id", "latitude", "longitude", "timestamp", "speed", "heading")
+            parsed_df = create_mock_data_stream(spark, "driver-locations")
         
+        if parsed_df is None:
+            return None
+            
         processed_df = parsed_df.withColumn("processed_at", current_timestamp())
         
         query = processed_df.writeStream \
@@ -221,37 +237,38 @@ def process_delivery_status(spark, use_kafka=True):
     try:
         logger.info("📦 Starting delivery status processing...")
         
-        delivery_schema = StructType([
-            StructField("delivery_id", StringType(), True),
-            StructField("status", StringType(), True),
-            StructField("timestamp", TimestampType(), True),
-            StructField("location", StringType(), True),
-            StructField("driver_id", StringType(), True),
-            StructField("customer_id", StringType(), True)
-        ])
-        
         if use_kafka:
-            df = spark \
-                .readStream \
-                .format("kafka") \
-                .option("kafka.bootstrap.servers", "kafka:29092") \
-                .option("subscribe", "delivery-status") \
-                .option("startingOffsets", "latest") \
-                .option("failOnDataLoss", "false") \
-                .load()
-            
-            parsed_df = df.select(
-                from_json(col("value").cast("string"), delivery_schema).alias("data")
-            ).select(" Writer: data.*")
+            try:
+                delivery_schema = StructType([
+                    StructField("delivery_id", StringType(), True),
+                    StructField("status", StringType(), True),
+                    StructField("timestamp", TimestampType(), True),
+                    StructField("location", StringType(), True),
+                    StructField("driver_id", StringType(), True),
+                    StructField("customer_id", StringType(), True)
+                ])
+                
+                df = spark \
+                    .readStream \
+                    .format("kafka") \
+                    .option("kafka.bootstrap.servers", "kafka:29092") \
+                    .option("subscribe", "delivery-status") \
+                    .option("startingOffsets", "latest") \
+                    .option("failOnDataLoss", "false") \
+                    .load()
+                
+                parsed_df = df.select(
+                    from_json(col("value").cast("string"), delivery_schema).alias("data")
+                ).select("data.*")  # Fixed the typo here
+            except Exception as e:
+                logger.warning(f"Kafka streaming failed, using mock data: {e}")
+                parsed_df = create_mock_data_stream(spark, "delivery-status")
         else:
-            parsed_df = spark.readStream.format("rate").option("rowsPerSecond", 1).load() \
-                .withColumn("delivery_id", concat(lit("del_"), col("value").cast("string"))) \
-                .withColumn("status", lit("delivered")) \
-                .withColumn("location", lit("NYC")) \
-                .withColumn("driver_id", lit("mock_driver")) \
-                .withColumn("customer_id", concat(lit("cust_"), col("value").cast("string"))) \
-                .select("delivery_id", "status", "timestamp", "location", "driver_id", "customer_id")
+            parsed_df = create_mock_data_stream(spark, "delivery-status")
         
+        if parsed_df is None:
+            return None
+            
         processed_df = parsed_df.withColumn("processed_at", current_timestamp())
         
         query = processed_df.writeStream \
@@ -274,25 +291,36 @@ def calculate_kpis(spark, use_kafka=True):
         logger.info("📊 Starting KPI calculations...")
         
         if use_kafka:
-            df = spark \
-                .readStream \
-                .format("kafka") \
-                .option("kafka.bootstrap.servers", "kafka:29092") \
-                .option("subscribe", "delivery-status") \
-                .option("startingOffsets", "latest") \
-                .option("failOnDataLoss", "false") \
-                .load()
-            
-            delivery_schema = StructType([
-                StructField("delivery_id", StringType(), True),
-                StructField("status", StringType(), True),
-                StructField("timestamp", TimestampType(), True),
-                StructField("driver_id", StringType(), True)
-            ])
-            
-            parsed_df = df.select(
-                from_json(col("value").cast("string"), delivery_schema).alias("data")
-            ).select("data.*")
+            try:
+                delivery_schema = StructType([
+                    StructField("delivery_id", StringType(), True),
+                    StructField("status", StringType(), True),
+                    StructField("timestamp", TimestampType(), True),
+                    StructField("driver_id", StringType(), True)
+                ])
+                
+                df = spark \
+                    .readStream \
+                    .format("kafka") \
+                    .option("kafka.bootstrap.servers", "kafka:29092") \
+                    .option("subscribe", "delivery-status") \
+                    .option("startingOffsets", "latest") \
+                    .option("failOnDataLoss", "false") \
+                    .load()
+                
+                parsed_df = df.select(
+                    from_json(col("value").cast("string"), delivery_schema).alias("data")
+                ).select("data.*")
+            except Exception as e:
+                logger.warning(f"Kafka streaming failed, using mock data: {e}")
+                parsed_df = spark.readStream.format("rate").option("rowsPerSecond", 2).load() \
+                    .withColumn("delivery_id", concat(lit("del_"), col("value").cast("string"))) \
+                    .withColumn("status", 
+                        when(col("value") % 3 == 0, "delivered")
+                        .when(col("value") % 3 == 1, "in_transit")
+                        .otherwise("picked_up")) \
+                    .withColumn("driver_id", concat(lit("driver_"), (col("value") % 5).cast("string"))) \
+                    .select("delivery_id", "status", "timestamp", "driver_id")
         else:
             parsed_df = spark.readStream.format("rate").option("rowsPerSecond", 2).load() \
                 .withColumn("delivery_id", concat(lit("del_"), col("value").cast("string"))) \
@@ -331,24 +359,30 @@ def main():
     """Main ETL pipeline execution"""
     logger.info("🚀 Starting Logistics ETL Pipeline...")
     
+    # Test connections (non-blocking)
     connections = test_connections()
     kafka_available = test_kafka_connection()
     
+    # Create Spark session with fallback
     spark = create_spark_session()
     if not spark:
         logger.error("❌ Cannot proceed without Spark session")
         return
     
+    # Start streaming queries
     queries = []
     
+    # Process driver locations
     driver_query = process_driver_locations(spark, use_kafka=kafka_available)
     if driver_query:
         queries.append(driver_query)
     
+    # Process delivery status
     delivery_query = process_delivery_status(spark, use_kafka=kafka_available)
     if delivery_query:
         queries.append(delivery_query)
     
+    # Calculate KPIs
     kpi_query = calculate_kpis(spark, use_kafka=kafka_available)
     if kpi_query:
         queries.append(kpi_query)
